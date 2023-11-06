@@ -1,2 +1,2 @@
-# green-urbanisation
-Repository with code for UN Datathon submission
+# Green Urbanisation
+The dashboard is available at https://filipr2.shinyapps.io/GreenUrbanisation/.
