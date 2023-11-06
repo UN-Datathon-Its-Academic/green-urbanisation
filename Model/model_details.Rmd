@@ -1,0 +1,186 @@
+---
+title: "Model details"
+author: 
+- email: s.contractor@unsw.edu.au
+  name: It's academic team
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  bookdown::html_document2
+fontsize: 12pt
+header-includes: 
+  \usepackage{float} \floatplacement{figure}{H} 
+bibliography: "https://api.citedrive.com/bib/bbf809b5-e0a6-41ec-a8e1-4e055cef8f9f/references.bib?x=eyJpZCI6ICJiYmY4MDliNS1lMGE2LTQxZWMtYThlMS00ZTA1NWNlZjhmOWYiLCAidXNlciI6ICI2NTEwIiwgInNpZ25hdHVyZSI6ICIyMTIyZDlkODFkNWI5MjFiYWYzOGU1MDExMzUwYjUxMTNiMDUxYmQxYzhkZGE5Y2M4YjM3YjdlZjViYzA5MDgyIn0=/bibliography.bib"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T,
+                      message = F,
+                      warning = F)
+```
+
+This document complements information presented in the dashboard. It contains technical information about the statistical modelling including the purposes of the model, associated statistical methodology and additional model results and validation diagnostics. Specifically, visualization and diagnostics associated with the predictive performances of the spatial Bayesian models. A leave-out data analysis is performed to assess model predictions with the exclusion of 20% of data randomly for each city using five prediction-performance measures.   
+
+### Spatial model {-}
+The spatial statistical model is developed to predict temperature anomalies (relative to 1981-2000 mean temperatures) across 5x5 km gridded locations within city bounding boxes. The model uses spatial random effects that are based on an automatic specification of spatial basis functions as well as fixed effects including greenness index, human population density and urban area. The model is fitted under an hybrid Bayesian and Frequentist framework using the R package FRK version 2.1.5 [@sainsbury2021modelling] and a normal probability distribution. Statistical and computational details can be found in the two main FRK papers  [@Zammit_Mangion_2021; @sainsbury2021modelling]. Model codes are available at <https://github.com/UN-Datathon-Its-Academic> for reproducibility. 
+
+```{r, echo = FALSE}
+rm(list=ls())
+source("R/packages.R")
+source("R/functions.R")
+
+#Import all data from the Data folder 
+datalist <- list.files(path = "Data/", pattern='_merged.csv$', all.files= T, full.names= T)
+
+# Predictive performance 
+list.indicators <- list()
+pred_sum_list <- list()
+```
+
+```{r, include=FALSE}
+for ( i in 1:length(datalist)){
+
+# Full dataset 
+ X_orign <- read.csv(datalist[i]) %>%
+    mutate(City = str_match(datalist[i], "/\\s*(.*?)\\s*_")[2])
+
+  # Select 80%
+ X <- X_orign %>% sample_frac(.80)
+
+ ## Convert to sf
+  grid_pred <- st_as_sfc(X$geometry)
+  st_geometry(X) <- grid_pred
+  
+# Remaining 20%
+  test  <- anti_join(X_orign, X , by = 'system.index')
+  grid_pred_test <- st_as_sfc(test$geometry)
+  st_geometry(test) <- grid_pred_test
+
+   ## Convert to sf
+  grid_pred <- st_as_sfc(X_orign$geometry)
+  st_geometry(X_orign) <- grid_pred
+
+# Making STObj - response variable 
+  X_Obj <- X %>% dplyr::select(temperature_anomaly) 
+  
+# Making BAUs - other covariates
+   ST_BAUs <- as_Spatial(X_orign %>% dplyr::select(!temperature_anomaly)%>% 
+                          mutate(dplyr::across(c(building_count:greenness), ~ as.numeric(scale(.)))))
+  
+  
+  ST_BAUs$fs <- 1                   # scalar fine-scale variance matrix
+
+  # Create basis functions
+  basis <- auto_basis(manifold = plane(),      # functions on sphere
+                      data=ST_BAUs, 
+                      nres = 3,                # use three DGGRID resolutions
+                      prune= 0                 # prune basis functions
+  )  
+  
+  ### Model 
+  mod <- FRK(f = temperature_anomaly ~ 1 + greenness + population_density + total_area, 
+             data = list(as_Spatial(X_Obj)), 
+             BAUs = ST_BAUs, 
+             basis = basis, 
+             response = "gaussian", 
+             K_type = "precision", 
+             method = "TMB", 
+             est_error = TRUE) %>%
+          suppressMessages() %>%
+          suppressWarnings()
+
+  pred <- predict(mod, type = c("mean"))
+
+  # Extracting posterior distributions of predictive locations 
+  
+  post_dist_df <- as.data.frame(pred$MC$mu_samples) %>% 
+    mutate(system.index = ST_BAUs@data$system.index) %>%
+    tidyr::pivot_longer(!system.index,
+                        names_to = "draw", 
+                        values_to = "pred"
+    )
+  
+  test_pred <- inner_join(test, post_dist_df, by = "system.index")
+
+  test_pred_sum <- test_pred %>% group_by(system.index) %>% 
+  ggdist::median_hdci(pred)%>%
+  inner_join(test_pred %>% group_by(system.index) %>% slice(1) %>%
+               dplyr::select(system.index,temperature_anomaly)) %>%
+    mutate(p_se = .upper - .lower) %>%
+    mutate(City = str_match(datalist[i], "/\\s*(.*?)\\s*_")[2])
+  
+pred_sum_list[[i]] <- test_pred_sum 
+
+## Measures
+
+list.indicators[[i]]<- c(test_pred_sum$City[1],round(coverage95(test_pred_sum$temperature_anomaly, test_pred_sum$.lower, test_pred_sum$.upper),2),
+  round(IS95(test_pred_sum$temperature_anomaly, test_pred_sum$.lower, test_pred_sum$.upper),2),
+  round(RMSPE(test_pred_sum$temperature_anomaly, test_pred_sum$pred),2),
+  round(crps(test_pred_sum$temperature_anomaly, data.frame(test_pred_sum$pred, test_pred_sum$p_se))$CRPS,2), round(AIC(mod),2))
+
+}
+```
+
+### Fixed effects {-}
+
+```{r, echo = FALSE}
+mod_list <- readRDS("Data/models.rds")
+coef_table_list <- list()
+
+for ( i in 1:length(mod_list)){
+coef_table_list[[i]] <- coef_uncertainty(mod_list[[i]], percentiles = c(2.5, 50, 97.5), nsim = 400, random_effects = FALSE)%>%
+  data.frame() %>%
+  tibble::rownames_to_column() %>%
+  tidyr::pivot_longer(cols =  !rowname, names_to = "param", values_to = "value")%>%
+  tidyr::pivot_wider(names_from = rowname, values_from = value) %>%
+  mutate(City =  mod_list[[i]]@BAUs$City[1])
+}
+
+coef_table <- data.frame(do.call(rbind,coef_table_list))
+#coef_table$param <- c("Intercept", "Greenness", "Human population density", "Building area")
+
+coef_table <- coef_table %>%
+  mutate(param = case_when(param == "greenness" ~ "Greenness", 
+                           param == "population_density" ~ "Population density",
+                           param == "total_area" ~ "Urban area",
+                           param == "Intercept" ~ "Intercept"))
+  
+p_coef <- ggplot(coef_table %>% filter(!param == "Intercept"), aes(y=param, x=X50.))+ geom_point() +
+  geom_errorbar(aes(y = param, xmin = X2.5., xmax = X97.5.), width=.1) + facet_wrap(~ City) +
+  geom_vline(xintercept = 0, linetype = "dashed") +theme_bw() +
+  xlab("Effect size") + ylab("")
+```
+
+```{r fig1, fig.align = 'center', fig.width=7,fig.height=7, fig.cap="Effect size of the model covariates for each city. Dots shows averaged size effect and error bars corresponding to the 95% credible intervals.", echo=FALSE}
+p_coef
+```
+
+
+```{r, echo = FALSE}
+pred_table <- data.frame(do.call(rbind,pred_sum_list))
+indicators_table <- data.frame(do.call(rbind,list.indicators))
+```
+
+```{r, echo = FALSE}
+p.pred <- ggplot(pred_table, aes(x=temperature_anomaly, y=pred)) + 
+   geom_abline(col="green", linetype = "dashed")+ 
+   geom_point() + facet_wrap(~City, scales = "free", ncol = 3) + 
+   theme_bw()+ xlab("Observed temperature anomaly") + ylab("Predicted temperature anomaly") + 
+   theme(axis.text.x = element_text(size=11),
+       axis.text.y = element_text(size=11),axis.title.y=element_text(size=12),
+       axis.title.x=element_text(size=12))
+```
+### Model predictive capability {-}
+
+```{r fig2, fig.align = 'center', fig.width=6,fig.height=7, fig.cap="Predicted temperature anomalies (y axis) relative to true temperature anomalies (x axis).", echo=FALSE}
+p.pred
+```
+
+With the exception of Singapore which had only 23 data points to train on, our predictions lie very close to the 1-1 line.
+
+### Model diagnostics {-}
+
+```{r, echo = FALSE}
+knitr::kable(data.frame(indicators_table), "pipe", 
+             col.name = c("City","95% coverage", "95% interval score", "Root-mean-squared prediction error", "Continuous ranked probability score", "AIC"),
+             align = c("l","c","c","c","c"), caption = "Measures of performance for model forecasts")
+```
